@@ -1,0 +1,412 @@
+from machine import Pin, SPI, RTC
+import framebuf
+import time
+import random
+
+PIN_SCK     = 4
+PIN_MOSI    = 6
+PIN_DC      = 1
+PIN_CS      = 7
+PIN_RST     = 0
+PIN_BUTTON  = 5
+PIN_BUZZER  = 3
+
+WIFI_SSID   = ""
+WIFI_PASS   = ""
+UTC_OFFSET = 2
+
+SET_TIME = (2026, 9, 29, 12, 0)
+
+MINUTE_BEEP_MS = 100
+
+WIDTH = 240
+HEIGHT = 240
+
+def color565(r, g, b):
+    return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+
+BLACK      = color565(0, 0, 0)
+WHITE      = color565(255, 255, 255)
+RED        = color565(255, 0, 0)
+GREEN      = color565(0, 255, 0)
+YELLOW     = color565(255, 255, 0)
+CYAN       = color565(0, 255, 255)
+ARENA      = color565(10, 16, 40)
+SNAKE_HEAD = color565(150, 255, 150)
+SNAKE_BODY = color565(0, 190, 70)
+
+buzzer = Pin(PIN_BUZZER, Pin.OUT, value=0)
+
+def beep(ms=150):
+    buzzer.value(1)
+    time.sleep_ms(ms)
+    buzzer.value(0)
+
+button = Pin(PIN_BUTTON, Pin.IN, Pin.PULL_UP)
+_last = 1
+
+def button_pressed():
+    global _last
+    now = button.value()
+    hit = (_last == 1 and now == 0)
+    _last = now
+    return hit
+
+def wait_or_button(ms):
+    t0 = time.ticks_ms()
+    while time.ticks_diff(time.ticks_ms(), t0) < ms:
+        if button_pressed():
+            time.sleep_ms(150)
+            return True
+        time.sleep_ms(5)
+    return False
+
+class GC9A01:
+    def __init__(self, spi, dc, cs, rst):
+        self.spi = spi
+        self.dc = dc
+        self.cs = cs
+        self.rst = rst
+        self.dc.init(Pin.OUT, value=0)
+        self.cs.init(Pin.OUT, value=1)
+        self.rst.init(Pin.OUT, value=1)
+        self._char_fb_buf = bytearray(8)
+        self._char_fb = framebuf.FrameBuffer(self._char_fb_buf, 8, 8, framebuf.MONO_HLSB)
+        self.init_display()
+
+    def cmd(self, c, data=None):
+        self.cs(0)
+        self.dc(0)
+        self.spi.write(bytes([c]))
+        if data:
+            self.dc(1)
+            self.spi.write(data)
+        self.cs(1)
+
+    def init_display(self):
+        self.rst(1); time.sleep_ms(50)
+        self.rst(0); time.sleep_ms(50)
+        self.rst(1); time.sleep_ms(150)
+
+        init = [
+            (0xEF, b''), (0xEB, b'\x14'), (0xFE, b''), (0xEF, b''),
+            (0xEB, b'\x14'), (0x84, b'\x40'), (0x85, b'\xFF'), (0x86, b'\xFF'),
+            (0x87, b'\xFF'), (0x88, b'\x0A'), (0x89, b'\x21'), (0x8A, b'\x00'),
+            (0x8B, b'\x80'), (0x8C, b'\x01'), (0x8D, b'\x01'), (0x8E, b'\xFF'),
+            (0x8F, b'\xFF'), (0xB6, b'\x00\x00'), (0x36, b'\x48'), (0x3A, b'\x05'),
+            (0x90, b'\x08\x08\x08\x08'), (0xBD, b'\x06'), (0xBC, b'\x00'),
+            (0xFF, b'\x60\x01\x04'), (0xC3, b'\x13'), (0xC4, b'\x13'),
+            (0xC9, b'\x22'), (0xBE, b'\x11'), (0xE1, b'\x10\x0E'),
+            (0xDF, b'\x21\x0C\x02'),
+            (0xF0, b'\x45\x09\x08\x08\x26\x2A'),
+            (0xF1, b'\x43\x70\x72\x36\x37\x6F'),
+            (0xF2, b'\x45\x09\x08\x08\x26\x2A'),
+            (0xF3, b'\x43\x70\x72\x36\x37\x6F'),
+            (0xED, b'\x1B\x0B'), (0xAE, b'\x77'), (0xCD, b'\x63'),
+            (0x70, b'\x07\x07\x04\x0E\x0F\x09\x07\x08\x03'), (0xE8, b'\x34'),
+            (0x62, b'\x18\x0D\x71\xED\x70\x70\x18\x0F\x71\xEF\x70\x70'),
+            (0x63, b'\x18\x11\x71\xF1\x70\x70\x18\x13\x71\xF3\x70\x70'),
+            (0x64, b'\x28\x29\xF1\x01\xF1\x00\x07'),
+            (0x66, b'\x3C\x00\xCD\x67\x45\x45\x10\x00\x00\x00'),
+            (0x67, b'\x00\x3C\x00\x00\x00\x01\x54\x10\x32\x98'),
+            (0x74, b'\x10\x85\x80\x00\x00\x4E\x00'), (0x98, b'\x3E\x07'),
+            (0x35, b''), (0x21, b''),
+        ]
+        for c, d in init:
+            self.cmd(c, d if d else None)
+
+        self.cmd(0x11); time.sleep_ms(120)
+        self.cmd(0x29); time.sleep_ms(20)
+
+    def set_window(self, x0, y0, x1, y1):
+        self.cmd(0x2A, bytes([x0 >> 8, x0 & 0xFF, x1 >> 8, x1 & 0xFF]))
+        self.cmd(0x2B, bytes([y0 >> 8, y0 & 0xFF, y1 >> 8, y1 & 0xFF]))
+        self.cmd(0x2C)
+
+    def fill_rect(self, x, y, w, h, color):
+        if w <= 0 or h <= 0:
+            return
+        self.set_window(x, y, x + w - 1, y + h - 1)
+        line = bytes([color >> 8, color & 0xFF]) * w
+        self.cs(0); self.dc(1)
+        for _ in range(h):
+            self.spi.write(line)
+        self.cs(1)
+
+    def fill(self, color):
+        self.fill_rect(0, 0, WIDTH, HEIGHT, color)
+
+    def draw_char(self, x, y, ch, fg, bg, scale):
+        fb = self._char_fb
+        fb.fill(0)
+        fb.text(ch, 0, 0, 1)
+        size = 8 * scale
+        buf = bytearray(size * size * 2)
+        fh, fl = fg >> 8, fg & 0xFF
+        bh, bl = bg >> 8, bg & 0xFF
+        i = 0
+        for row in range(8):
+            row_bytes = bytearray(size * 2)
+            j = 0
+            for col in range(8):
+                if fb.pixel(col, row):
+                    hi, lo = fh, fl
+                else:
+                    hi, lo = bh, bl
+                for _ in range(scale):
+                    row_bytes[j] = hi
+                    row_bytes[j + 1] = lo
+                    j += 2
+            for _ in range(scale):
+                buf[i:i + size * 2] = row_bytes
+                i += size * 2
+        self.set_window(x, y, x + size - 1, y + size - 1)
+        self.cs(0); self.dc(1)
+        self.spi.write(buf)
+        self.cs(1)
+
+    def text(self, s, x, y, fg=WHITE, bg=BLACK, scale=2):
+        for ch in s:
+            self.draw_char(x, y, ch, fg, bg, scale)
+            x += 8 * scale
+
+    def text_centered(self, s, y, fg=WHITE, bg=BLACK, scale=2):
+        x = (WIDTH - len(s) * 8 * scale) // 2
+        self.text(s, x, y, fg, bg, scale)
+
+spi = SPI(1, baudrate=40_000_000, polarity=0, phase=0,
+          sck=Pin(PIN_SCK), mosi=Pin(PIN_MOSI))
+tft = GC9A01(spi, Pin(PIN_DC), Pin(PIN_CS), Pin(PIN_RST))
+
+DAYS   = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
+MONTHS = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+          "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+utc_offset = 0
+
+def show_status(line1, line2="", color=WHITE):
+    tft.fill(BLACK)
+    tft.text_centered(line1, 100, color, BLACK, 2)
+    if line2:
+        tft.text_centered(line2[:24], 130, WHITE, BLACK, 1)
+
+def sync_time():
+    import network, ntptime
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    time.sleep_ms(1000)
+    for attempt in range(3):
+        wlan.connect(WIFI_SSID, WIFI_PASS)
+        for _ in range(120):
+            if wlan.isconnected():
+                break
+            time.sleep_ms(100)
+        if wlan.isconnected():
+            break
+        print("WiFi attempt", attempt + 1, "failed, status", wlan.status())
+    if not wlan.isconnected():
+        return "WiFi failed", "check name/pass, 2.4GHz"
+    for host in ("pool.ntp.org", "time.google.com", "time.cloudflare.com"):
+        for _ in range(2):
+            try:
+                ntptime.host = host
+                ntptime.settime()
+                wlan.active(False)
+                return None, None
+            except Exception as e:
+                print("NTP error:", host, e)
+                time.sleep_ms(500)
+    return "Time failed", "no internet?"
+
+def setup_time():
+    global utc_offset
+    if not WIFI_SSID:
+        show_status("No WiFi set", "fill in WIFI_SSID", YELLOW)
+        time.sleep(3)
+    else:
+        show_status("Connecting", WIFI_SSID, CYAN)
+        try:
+            err, hint = sync_time()
+        except Exception as e:
+            print("Sync error:", e)
+            err, hint = "Sync error", str(e)
+        if err is None:
+            show_status("Time synced", "", GREEN)
+            time.sleep(1)
+            utc_offset = UTC_OFFSET
+            return
+        show_status(err, hint, RED)
+        time.sleep(4)
+    y, mo, d, h, mi = SET_TIME
+    RTC().datetime((y, mo, d, 0, h, mi, 0, 0))
+    utc_offset = 0
+
+def local_now():
+    return time.localtime(time.time() + utc_offset * 3600)
+
+last_t = ""
+last_s = ""
+last_d = ""
+
+def draw_diff(new, old, y, fg, scale):
+    x0 = (WIDTH - len(new) * 8 * scale) // 2
+    for i, ch in enumerate(new):
+        if i >= len(old) or old[i] != ch:
+            tft.draw_char(x0 + i * 8 * scale, y, ch, fg, BLACK, scale)
+
+def draw_watch_face():
+    global last_t, last_s, last_d
+    tft.fill(BLACK)
+    last_t = ""
+    last_s = ""
+    last_d = ""
+
+def update_watch():
+    global last_t, last_s, last_d
+    y, mo, d, h, mi, s, wd = local_now()[0:7]
+    t = "%02d:%02d" % (h, mi)
+    sec = "%02d" % s
+    dt = "%s %02d %s" % (DAYS[wd], d, MONTHS[mo - 1])
+    draw_diff(t, last_t, 65, WHITE, 5)
+    draw_diff(sec, last_s, 120, CYAN, 4)
+    draw_diff(dt, last_d, 168, YELLOW, 2)
+    if MINUTE_BEEP_MS and last_t != "" and t != last_t:
+        beep(MINUTE_BEEP_MS)
+    last_t, last_s, last_d = t, sec, dt
+
+COLS = 22
+CELL = 9
+OFF = 21
+STEP_MS = 90
+DIRS = ((1, 0), (-1, 0), (0, 1), (0, -1))
+
+VSET = set()
+for _i in range(COLS):
+    for _j in range(COLS):
+        _dx = _i + 0.5 - COLS / 2
+        _dy = _j + 0.5 - COLS / 2
+        if _dx * _dx + _dy * _dy <= 121:
+            VSET.add((_i, _j))
+CELLS = list(VSET)
+ROWS = []
+for _j in range(COLS):
+    _row = [_i for _i in range(COLS) if (_i, _j) in VSET]
+    if _row:
+        ROWS.append((_j, _row[0], _row[-1]))
+
+def cell(i, j, color):
+    tft.fill_rect(OFF + i * CELL + 1, OFF + j * CELL + 1, CELL - 2, CELL - 2, color)
+
+def draw_arena():
+    tft.fill(BLACK)
+    for j, a, b in ROWS:
+        tft.fill_rect(OFF + a * CELL, OFF + j * CELL, (b - a + 1) * CELL, CELL, ARENA)
+
+def bfs(start, goal, blocked):
+    prev = {start: None}
+    q = [start]
+    k = 0
+    while k < len(q):
+        cur = q[k]
+        k += 1
+        if cur == goal:
+            step = cur
+            while prev[step] != start:
+                step = prev[step]
+            return step
+        for di, dj in DIRS:
+            n = (cur[0] + di, cur[1] + dj)
+            if n in VSET and n not in prev and n not in blocked:
+                prev[n] = cur
+                q.append(n)
+    return None
+
+def pick_move(body, occupied, food):
+    head = body[0]
+    tail = body[-1]
+    blocked = occupied - {tail}
+    step = bfs(head, food, blocked)
+    if step is None:
+        step = bfs(head, tail, blocked)
+    if step is None:
+        best_score = -1
+        for di, dj in DIRS:
+            n = (head[0] + di, head[1] + dj)
+            if n in VSET and n not in blocked:
+                free = 0
+                for a, b in DIRS:
+                    m = (n[0] + a, n[1] + b)
+                    if m in VSET and m not in blocked:
+                        free += 1
+                if free > best_score:
+                    best_score = free
+                    step = n
+    return step
+
+def spawn_food(occupied):
+    free = [c for c in CELLS if c not in occupied]
+    if not free:
+        return None
+    return free[random.randrange(len(free))]
+
+def play_game():
+    while True:
+        draw_arena()
+        body = [(11, 11), (10, 11), (9, 11)]
+        occupied = set(body)
+        for c in body[1:]:
+            cell(c[0], c[1], SNAKE_BODY)
+        cell(body[0][0], body[0][1], SNAKE_HEAD)
+        food = spawn_food(occupied)
+        cell(food[0], food[1], RED)
+
+        while True:
+            if wait_or_button(STEP_MS):
+                return
+            step = pick_move(body, occupied, food)
+            if step is None:
+                break
+            ate = (step == food)
+            if not ate:
+                tail = body.pop()
+                occupied.discard(tail)
+                cell(tail[0], tail[1], ARENA)
+            old_head = body[0]
+            body.insert(0, step)
+            occupied.add(step)
+            cell(old_head[0], old_head[1], SNAKE_BODY)
+            cell(step[0], step[1], SNAKE_HEAD)
+            if ate:
+                beep(20)
+                food = spawn_food(occupied)
+                if food is None:
+                    break
+                cell(food[0], food[1], RED)
+
+        score = len(body) - 3
+        beep(300)
+        tft.fill_rect(30, 85, 180, 70, BLACK)
+        tft.text_centered("GAME OVER", 90, RED, BLACK, 2)
+        tft.text_centered("SCORE %d" % score, 120, WHITE, BLACK, 2)
+        if wait_or_button(2000):
+            return
+
+def main():
+    print("Watch started")
+    setup_time()
+    print("Time is now:", local_now())
+    draw_watch_face()
+    while True:
+        try:
+            update_watch()
+        except Exception as e:
+            print("Clock error:", e)
+            show_status("Clock error", str(e), RED)
+            time.sleep(3)
+            draw_watch_face()
+        if wait_or_button(100):
+            beep(80)
+            play_game()
+            beep(80)
+            draw_watch_face()
+
+main()
